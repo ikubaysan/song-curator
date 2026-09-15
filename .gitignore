@@ -2,3 +2,4 @@
 venv/
 *.log
 song_curator_settings.json
+song_curator_session.json
