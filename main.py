@@ -764,6 +764,11 @@ class AudioPlayer:
         self.play_started_at = 0.0
         self.play_duration_seconds = 0.0
 
+        # Amount of time that has elapsed before the most recent pause.
+        self.elapsed_before_pause = 0.0
+
+        self.is_paused = False
+
         self._initialize()
 
     def _initialize(self) -> None:
@@ -789,7 +794,7 @@ class AudioPlayer:
         start_seconds: float,
         duration_seconds: float,
     ) -> None:
-        """Play a song starting at a specified position."""
+        """Start or restart a preview from the specified position."""
 
         if not self.initialized:
             raise RuntimeError(
@@ -850,8 +855,71 @@ class AudioPlayer:
             duration_seconds,
         )
 
+        self.elapsed_before_pause = 0.0
+        self.is_paused = False
+
+    def pause(self) -> None:
+        """Pause the current preview."""
+
+        if not self.initialized:
+            return
+
+        if not self.is_playing():
+            return
+
+        try:
+            elapsed = (
+                time.monotonic()
+                - self.play_started_at
+            )
+
+            self.elapsed_before_pause += max(
+                0.0,
+                elapsed,
+            )
+
+            pygame.mixer.music.pause()
+
+            self.is_paused = True
+
+            LOGGER.info(
+                "Playback paused."
+            )
+
+        except Exception:
+            LOGGER.exception(
+                "Could not pause playback."
+            )
+
+    def resume(self) -> None:
+        """Resume paused playback."""
+
+        if not self.initialized:
+            return
+
+        if not self.is_paused:
+            return
+
+        try:
+            pygame.mixer.music.unpause()
+
+            self.play_started_at = (
+                time.monotonic()
+            )
+
+            self.is_paused = False
+
+            LOGGER.info(
+                "Playback resumed."
+            )
+
+        except Exception:
+            LOGGER.exception(
+                "Could not resume playback."
+            )
+
     def stop(self) -> None:
-        """Stop playback."""
+        """Stop playback and reset playback state."""
 
         if not self.initialized:
             return
@@ -865,11 +933,16 @@ class AudioPlayer:
 
         self.play_started_at = 0.0
         self.play_duration_seconds = 0.0
+        self.elapsed_before_pause = 0.0
+        self.is_paused = False
 
     def is_playing(self) -> bool:
-        """Return whether pygame currently reports playback."""
+        """Return whether pygame currently reports active playback."""
 
         if not self.initialized:
+            return False
+
+        if self.is_paused:
             return False
 
         try:
@@ -877,15 +950,24 @@ class AudioPlayer:
         except Exception:
             return False
 
+    def is_paused_state(self) -> bool:
+        """Return whether playback is currently paused."""
+
+        return self.is_paused
+
     def preview_expired(self) -> bool:
         """Return whether the configured preview duration elapsed."""
 
         if self.play_started_at <= 0:
             return False
 
+        if self.is_paused:
+            return False
+
         elapsed = (
             time.monotonic()
             - self.play_started_at
+            + self.elapsed_before_pause
         )
 
         return (
@@ -1325,6 +1407,10 @@ class SongCuratorApp:
 
         self.is_analyzing = False
         self.is_exporting = False
+
+        # True when the user has started continuous playback.
+        # Once enabled, classifying a song automatically starts the next one.
+        self.auto_play = False
 
         self.current_song_token = 0
 
@@ -1767,14 +1853,34 @@ class SongCuratorApp:
             pady=(5, 0),
         )
 
-        self.play_button = ttk.Button(
+        playback_frame = ttk.Frame(
             frame,
+        )
+
+        playback_frame.pack(
+            pady=(10, 0),
+        )
+
+        self.play_button = ttk.Button(
+            playback_frame,
             text="▶  Play / Restart Preview",
             command=self._play_current,
         )
 
         self.play_button.pack(
-            pady=(10, 0),
+            side="left",
+            padx=(0, 5),
+        )
+
+        self.pause_button = ttk.Button(
+            playback_frame,
+            text="⏸  Pause",
+            command=self._pause_or_resume_current,
+        )
+
+        self.pause_button.pack(
+            side="left",
+            padx=(5, 0),
         )
 
     def _build_action_panel(self) -> None:
@@ -2141,13 +2247,12 @@ class SongCuratorApp:
         self._refresh_queue()
         self._update_counts()
 
-        # If there wasn't already a song playing/being analyzed,
-        # start the new queue.
+        # Analyze the first queued song so it is ready to play.
+        # Analysis does NOT start playback.
         if (
-            self.song_queue.current_song is not None
-            and not self.is_analyzing
-            and not self.audio_player.is_playing()
-            and self.current_analysis is None
+                self.song_queue.current_song is not None
+                and not self.is_analyzing
+                and self.current_analysis is None
         ):
             self._show_current_song()
 
@@ -2423,35 +2528,45 @@ class SongCuratorApp:
             )
         )
 
-        try:
-            self.audio_player.play(
-                path=song.path,
-                start_seconds=(
-                    result.active_start_seconds
-                ),
-                duration_seconds=(
-                    preview_end
-                    - result.active_start_seconds
-                ),
+        if self.auto_play:
+            try:
+                self.audio_player.play(
+                    path=song.path,
+                    start_seconds=(
+                        result.active_start_seconds
+                    ),
+                    duration_seconds=(
+                            preview_end
+                            - result.active_start_seconds
+                    ),
+                )
+
+                self.pause_button.configure(
+                    text="⏸  Pause"
+                )
+
+                self.status_var.set(
+                    "Preview playing. Choose LIKE or DISLIKE."
+                )
+
+            except Exception as exc:
+                LOGGER.exception(
+                    "Could not play %s.",
+                    song.path,
+                )
+
+                self._skip_unplayable_song(
+                    song,
+                    token,
+                    exc,
+                )
+
+                return
+
+        else:
+            self.status_var.set(
+                "Ready. Press Play to start continuous playback."
             )
-
-        except Exception as exc:
-            LOGGER.exception(
-                "Could not play %s.",
-                song.path,
-            )
-
-            self._skip_unplayable_song(
-                song,
-                token,
-                exc,
-            )
-
-            return
-
-        self.status_var.set(
-            "Choose LIKE or DISLIKE."
-        )
 
         self._enable_action_buttons()
 
@@ -2497,8 +2612,8 @@ class SongCuratorApp:
     # Playback
     # ------------------------------------------------------------------
 
-    def _play_current(self) -> None:
-        """Restart current song's preview."""
+    def _pause_or_resume_current(self) -> None:
+        """Pause or resume continuous playback."""
 
         song = self.song_queue.current_song
 
@@ -2509,9 +2624,52 @@ class SongCuratorApp:
             return
 
         if self.current_analysis is None:
-            self._start_analysis(
-                song,
-                self.current_song_token,
+            return
+
+        if self.audio_player.is_paused_state():
+            # Resume playback and continue automatic advancement.
+            self.auto_play = True
+
+            self.audio_player.resume()
+
+            self.pause_button.configure(
+                text="⏸  Pause"
+            )
+
+            self.status_var.set(
+                "Preview resumed. Choose LIKE or DISLIKE."
+            )
+
+            return
+
+        if self.audio_player.is_playing():
+            # Pausing also disables automatic advancement.
+            self.auto_play = False
+
+            self.audio_player.pause()
+
+            self.pause_button.configure(
+                text="▶  Resume"
+            )
+
+            self.status_var.set(
+                "Preview paused."
+            )
+
+    def _play_current(self) -> None:
+        """Start continuous playback of the current song."""
+
+        song = self.song_queue.current_song
+
+        if song is None:
+            return
+
+        if self.is_analyzing:
+            return
+
+        if self.current_analysis is None:
+            self.status_var.set(
+                "Please wait for audio analysis to finish."
             )
 
             return
@@ -2536,24 +2694,32 @@ class SongCuratorApp:
         )
 
         try:
+            # Tell the application that the user has started
+            # continuous playback.
+            self.auto_play = True
+
             self.audio_player.play(
                 path=song.path,
                 start_seconds=(
                     self.current_analysis.active_start_seconds
                 ),
                 duration_seconds=(
-                    preview_end
-                    - self.current_analysis.active_start_seconds
+                        preview_end
+                        - self.current_analysis.active_start_seconds
                 ),
             )
 
+            self.pause_button.configure(
+                text="⏸  Pause"
+            )
+
             self.status_var.set(
-                "Choose LIKE or DISLIKE."
+                "Preview playing. Choose LIKE or DISLIKE."
             )
 
         except Exception as exc:
             LOGGER.exception(
-                "Could not replay %s.",
+                "Could not play %s.",
                 song.path,
             )
 
@@ -2563,12 +2729,55 @@ class SongCuratorApp:
                 exc,
             )
 
+
+    def _pause_or_resume_current(self) -> None:
+        """Pause or resume the current preview."""
+
+        song = self.song_queue.current_song
+
+        if song is None:
+            return
+
+        if self.is_analyzing:
+            return
+
+        if self.current_analysis is None:
+            return
+
+        if self.audio_player.is_paused_state():
+            self.audio_player.resume()
+
+            self.pause_button.configure(
+                text="⏸  Pause"
+            )
+
+            self.status_var.set(
+                "Preview resumed. Choose LIKE or DISLIKE."
+            )
+
+            return
+
+        if self.audio_player.is_playing():
+            self.audio_player.pause()
+
+            self.pause_button.configure(
+                text="▶  Resume"
+            )
+
+            self.status_var.set(
+                "Preview paused."
+            )
+
     def _playback_timer(self) -> None:
         """Periodically check whether the preview has ended."""
 
         try:
             if self.audio_player.preview_expired():
                 self.audio_player.stop()
+
+                self.pause_button.configure(
+                    text="⏸  Pause"
+                )
 
                 if self.song_queue.current_song is not None:
                     self.status_var.set(
@@ -2594,8 +2803,8 @@ class SongCuratorApp:
     # ------------------------------------------------------------------
 
     def _classify(
-        self,
-        liked: bool,
+            self,
+            liked: bool,
     ) -> None:
         """Classify the currently displayed song."""
 
@@ -2607,7 +2816,7 @@ class SongCuratorApp:
         if song is None:
             return
 
-        # Stop immediately.
+        # Stop the current preview immediately.
         self.audio_player.stop()
 
         classified = (
@@ -2635,7 +2844,10 @@ class SongCuratorApp:
         self._refresh_queue()
         self._update_counts()
 
-        # Automatically advance.
+        # Automatically advance to the next song.
+        #
+        # If auto_play is True, _analysis_finished() will
+        # automatically start the next preview.
         self.root.after(
             100,
             self._show_current_song,
@@ -2705,7 +2917,7 @@ class SongCuratorApp:
     # ------------------------------------------------------------------
 
     def _enable_action_buttons(self) -> None:
-        """Enable classification controls."""
+        """Enable classification and playback controls."""
 
         self.like_button.configure(
             state="normal"
@@ -2716,11 +2928,15 @@ class SongCuratorApp:
         )
 
         self.play_button.configure(
+            state="normal"
+        )
+
+        self.pause_button.configure(
             state="normal"
         )
 
     def _disable_action_buttons(self) -> None:
-        """Disable classification controls."""
+        """Disable classification and playback controls."""
 
         self.like_button.configure(
             state="disabled"
@@ -2732,6 +2948,14 @@ class SongCuratorApp:
 
         self.play_button.configure(
             state="disabled"
+        )
+
+        self.pause_button.configure(
+            state="disabled"
+        )
+
+        self.pause_button.configure(
+            text="⏸  Pause"
         )
 
     # ------------------------------------------------------------------
@@ -2784,6 +3008,7 @@ class SongCuratorApp:
         """Clear pending queue."""
 
         self.audio_player.stop()
+        self.auto_play = False
 
         self.current_song_token += 1
         self.current_analysis = None
@@ -2863,6 +3088,7 @@ class SongCuratorApp:
             return
 
         self.audio_player.stop()
+        self.auto_play = False
 
         self.current_song_token += 1
         self.current_analysis = None
