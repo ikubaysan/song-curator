@@ -18,8 +18,10 @@ Features
   liked, disliked, skipped and remaining songs intact.
 - Copy or move liked files to an output directory with SHA-256 duplicate
   detection (identical files skipped, different files overwritten).
-- Delete every disliked file from disk, to the recycle bin when send2trash is
-  installed and permanently otherwise.
+- Delete every disliked file from disk, sending it to the recycle bin.
+- Step Back and Forward through every song reviewed so far, and reclassify
+  any song at any time — LIKE and DISLIKE always apply to whatever is on
+  screen, then a Resume Queue button jumps straight back to where you left off.
 - FFmpeg / playback failures skip the song instead of crashing.
 - Settings are saved to JSON and restored on startup.
 - Logging to console and song_curator.log.
@@ -27,8 +29,6 @@ Features
 Requirements
 ------------
     pip install pygame tkinterdnd2 send2trash
-
-send2trash is optional. Without it, deleting disliked files is permanent.
 
 FFmpeg
 ------
@@ -61,7 +61,6 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import pygame
-
 import tkinterdnd2
 from tkinterdnd2 import DND_FILES
 from send2trash import send2trash
@@ -112,6 +111,10 @@ STATUS_DISLIKED = "disliked"
 STATUS_SKIPPED = "skipped"
 
 VALID_STATUSES = {STATUS_PENDING, STATUS_LIKED, STATUS_DISLIKED, STATUS_SKIPPED}
+
+# Maximum wall-clock time allowed for FFmpeg activity analysis.
+# Songs that take longer than this are automatically skipped.
+ANALYSIS_TIMEOUT_SECONDS = 5.0
 
 
 # ============================================================================
@@ -476,11 +479,11 @@ class FFmpegManager:
         return duration
 
     def find_most_active_section(
-        self,
-        path: Path,
-        preview_seconds: float,
-        duration_seconds: float,
-        progress_callback: Optional[Callable[[float], None]] = None,
+            self,
+            path: Path,
+            preview_seconds: float,
+            duration_seconds: float,
+            progress_callback: Optional[Callable[[float], None]] = None,
     ) -> float:
         """
         Find the most active contiguous section of the requested length.
@@ -488,6 +491,10 @@ class FFmpegManager:
         Audio is decoded to mono 16-bit PCM, split into small blocks, and the
         RMS energy of each block is summed over a sliding window. The window
         with the highest total energy wins.
+
+        FFmpeg is given a wall-clock timeout. If analysis takes longer than
+        ANALYSIS_TIMEOUT_SECONDS, FFmpeg is terminated and a RuntimeError is
+        raised so the caller can skip the song.
 
         Returns:
             Start time of the most active section.
@@ -507,7 +514,12 @@ class FFmpegManager:
             "-f", "s16le", "pipe:1",
         ]
 
-        LOGGER.info("Analyzing activity with FFmpeg: %s", path)
+        LOGGER.info(
+            "Analyzing activity with FFmpeg: %s "
+            "(timeout: %.1f seconds)",
+            path,
+            ANALYSIS_TIMEOUT_SECONDS,
+        )
 
         process = subprocess.Popen(
             command,
@@ -521,13 +533,20 @@ class FFmpegManager:
             raise RuntimeError("Could not open FFmpeg stdout.")
 
         bytes_per_sample = 2
-        bytes_per_block = int(ANALYSIS_SAMPLE_RATE * block_seconds * bytes_per_sample)
+        bytes_per_block = int(
+            ANALYSIS_SAMPLE_RATE
+            * block_seconds
+            * bytes_per_sample
+        )
 
         if bytes_per_block <= 0:
             process.kill()
             raise RuntimeError("Invalid FFmpeg analysis block size.")
 
-        window_blocks = max(1, int(round(preview_seconds / block_seconds)))
+        window_blocks = max(
+            1,
+            int(round(preview_seconds / block_seconds)),
+        )
 
         energy_window: deque[tuple[int, float]] = deque()
         energy_sum = 0.0
@@ -539,6 +558,63 @@ class FFmpegManager:
         bytes_processed = 0
         last_progress = 0.0
 
+        # The stdout.read() call can block while FFmpeg is working. Therefore,
+        # checking time.time() inside the loop is NOT sufficient. A separate
+        # watchdog thread is used to terminate FFmpeg even while read() is
+        # blocked.
+        analysis_timed_out = threading.Event()
+        watchdog_finished = threading.Event()
+
+        def watchdog() -> None:
+            """Terminate FFmpeg if the analysis exceeds the time limit."""
+
+            if watchdog_finished.wait(ANALYSIS_TIMEOUT_SECONDS):
+                return
+
+            analysis_timed_out.set()
+
+            LOGGER.warning(
+                "FFmpeg activity analysis timed out after %.1f seconds: %s",
+                ANALYSIS_TIMEOUT_SECONDS,
+                path,
+            )
+
+            try:
+                process.terminate()
+            except Exception:
+                LOGGER.exception(
+                    "Could not terminate timed-out FFmpeg process: %s",
+                    path,
+                )
+
+            # Give FFmpeg a short opportunity to terminate normally.
+            try:
+                process.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                LOGGER.warning(
+                    "Timed-out FFmpeg process did not terminate normally. "
+                    "Killing it: %s",
+                    path,
+                )
+
+                try:
+                    process.kill()
+                except Exception:
+                    LOGGER.exception(
+                        "Could not kill timed-out FFmpeg process: %s",
+                        path,
+                    )
+
+        watchdog_thread = threading.Thread(
+            target=watchdog,
+            name="FFmpegAnalysisWatchdog",
+            daemon=True,
+        )
+
+        watchdog_thread.start()
+
+        stderr_data = b""
+
         try:
             while True:
                 raw_block = process.stdout.read(bytes_per_block)
@@ -546,7 +622,10 @@ class FFmpegManager:
                 if not raw_block:
                     break
 
-                usable = (len(raw_block) // bytes_per_sample) * bytes_per_sample
+                usable = (
+                                 len(raw_block) // bytes_per_sample
+                         ) * bytes_per_sample
+
                 raw_block = raw_block[:usable]
 
                 if not raw_block:
@@ -561,7 +640,10 @@ class FFmpegManager:
                     _, old_energy = energy_window.popleft()
                     energy_sum -= old_energy
 
-                if len(energy_window) == window_blocks and energy_sum > best_energy:
+                if (
+                        len(energy_window) == window_blocks
+                        and energy_sum > best_energy
+                ):
                     best_energy = energy_sum
                     best_block_index = energy_window[0][0]
 
@@ -569,21 +651,26 @@ class FFmpegManager:
                 bytes_processed += len(raw_block)
 
                 if progress_callback is not None:
-                    estimated_seconds = bytes_processed / (ANALYSIS_SAMPLE_RATE * bytes_per_sample)
+                    estimated_seconds = (
+                            bytes_processed
+                            / (ANALYSIS_SAMPLE_RATE * bytes_per_sample)
+                    )
 
-                    # Report at most a few times per second of audio.
+                    # Report approximately once per second of decoded audio.
                     if estimated_seconds - last_progress >= 1.0:
                         last_progress = estimated_seconds
                         progress_callback(estimated_seconds)
 
         finally:
+            # Tell the watchdog that normal analysis is finished.
+            watchdog_finished.set()
+
             try:
                 process.stdout.close()
             except Exception:
                 pass
 
-        stderr_data = b""
-
+        # Read FFmpeg's stderr after stdout has been closed.
         if process.stderr is not None:
             try:
                 stderr_data = process.stderr.read()
@@ -597,17 +684,45 @@ class FFmpegManager:
 
         return_code = process.wait()
 
+        # The watchdog may have terminated FFmpeg while stdout.read() was
+        # blocked. Check this separately so the caller gets a useful message.
+        if analysis_timed_out.is_set():
+            raise RuntimeError(
+                f"FFmpeg activity analysis exceeded the "
+                f"{ANALYSIS_TIMEOUT_SECONDS:.1f}-second timeout."
+            )
+
         if return_code != 0:
-            stderr_text = stderr_data.decode("utf-8", errors="replace").strip()
-            raise RuntimeError(f"FFmpeg failed with exit code {return_code}: {stderr_text}")
+            stderr_text = stderr_data.decode(
+                "utf-8",
+                errors="replace",
+            ).strip()
+
+            raise RuntimeError(
+                f"FFmpeg failed with exit code {return_code}: "
+                f"{stderr_text}"
+            )
 
         if best_energy < 0:
-            raise RuntimeError("FFmpeg did not provide enough audio data for analysis.")
+            raise RuntimeError(
+                "FFmpeg did not provide enough audio data for analysis."
+            )
 
         active_start = best_block_index * block_seconds
 
         # Never let the preview run past the end of the song.
-        max_start = max(0.0, duration_seconds - preview_seconds)
+        max_start = max(
+            0.0,
+            duration_seconds - preview_seconds,
+        )
+
+        LOGGER.info(
+            "Most active section starts at %.2f seconds "
+            "(max allowed: %.2f) for %.2f seconds.",
+            active_start,
+            max_start,
+            preview_seconds,
+        )
 
         return min(active_start, max_start)
 
@@ -1021,8 +1136,8 @@ class SongQueue:
         return self._with_status(STATUS_SKIPPED)
 
     @property
-    def current_song(self) -> Optional[Song]:
-        """Return the first pending song."""
+    def first_pending(self) -> Optional[Song]:
+        """Return the first not-yet-classified song, i.e. the review frontier."""
 
         for song in self.songs:
             if self._status.get(song.key) == STATUS_PENDING:
@@ -1040,6 +1155,14 @@ class SongQueue:
         """Return the status of a song."""
 
         return self._status.get(song.key, STATUS_PENDING)
+
+    def index_of(self, song: Song) -> Optional[int]:
+        """Return a song's position in the ordered list, if it is still present."""
+
+        try:
+            return self.songs.index(song)
+        except ValueError:
+            return None
 
     def records(self) -> list[tuple[Path, str]]:
         """Return (path, status) pairs for persistence."""
@@ -1074,39 +1197,23 @@ class SongQueue:
         if song.key in self._status:
             self._status[song.key] = status
 
-    def classify_current(self, liked: bool) -> Optional[Song]:
-        """Classify the current song and return it."""
+    def classify(self, song: Song, liked: bool) -> bool:
+        """
+        Set a song's status to liked or disliked.
 
-        song = self.current_song
+        Works on any song, not just the review frontier, so a song reviewed
+        earlier can always be revisited and reclassified.
 
-        if song is None:
-            return None
+        Returns:
+            True if the song was known and updated, False otherwise.
+        """
+
+        if song.key not in self._status:
+            return False
 
         self._status[song.key] = STATUS_LIKED if liked else STATUS_DISLIKED
 
-        return song
-
-    def requeue(self, song: Song) -> None:
-        """Send a song back to the queue so it is reviewed next."""
-
-        if song.key not in self._status:
-            return
-
-        self._status[song.key] = STATUS_PENDING
-
-        try:
-            self.songs.remove(song)
-        except ValueError:
-            return
-
-        insert_at = len(self.songs)
-
-        for index, other in enumerate(self.songs):
-            if self._status.get(other.key) == STATUS_PENDING:
-                insert_at = index
-                break
-
-        self.songs.insert(insert_at, song)
+        return True
 
     def relocate(self, old_path: Path, new_path: Path) -> None:
         """Update a song's path after it was moved on disk."""
@@ -1261,7 +1368,6 @@ class SongCuratorApp:
         records = self.session_manager.load()
 
         if not records:
-            self._update_counts()
             self._refresh_lists()
             return
 
@@ -1288,11 +1394,9 @@ class SongCuratorApp:
 
         self.status_var.set(summary)
 
-        self._refresh_lists()
-        self._update_counts()
-
-        if self.song_queue.current_song is not None:
-            self._show_current_song()
+        # _show_song() overwrites the status text with "Analyzing: ..." when
+        # there is a song to show, exactly like a fresh queue advance would.
+        self._show_song(self.song_queue.first_pending)
 
     def _schedule_session_save(self) -> None:
         """Save the session shortly after the latest change."""
@@ -1327,6 +1431,7 @@ class SongCuratorApp:
         self._build_settings_panel()
         self._build_drop_panel()
         self._build_current_song_panel()
+        self._build_navigation_panel()
         self._build_action_panel()
         self._build_lists_panel()
         self._build_status_panel()
@@ -1433,6 +1538,22 @@ class SongCuratorApp:
             playback_frame, text="⏸  Pause", command=self._pause_or_resume_current)
         self.pause_button.pack(side="left", padx=(5, 0))
 
+    def _build_navigation_panel(self) -> None:
+        """Build controls for moving through the review history."""
+
+        frame = ttk.Frame(self.root)
+        frame.pack(fill="x", padx=20, pady=(0, 5))
+
+        self.back_button = ttk.Button(frame, text="◀  Back", command=self._go_back)
+        self.back_button.pack(side="left")
+
+        self.resume_button = ttk.Button(
+            frame, text="Resume Queue  ⏭", command=self._resume_to_frontier)
+        self.resume_button.pack(side="left", expand=True)
+
+        self.forward_button = ttk.Button(frame, text="Forward  ▶", command=self._go_forward)
+        self.forward_button.pack(side="right")
+
     def _build_action_panel(self) -> None:
         """Build the large classification buttons."""
 
@@ -1507,14 +1628,18 @@ class SongCuratorApp:
 
             scrollbar.configure(command=listbox.yview)
 
-            listbox.bind("<Double-Button-1>", lambda event, name=key: self._requeue_selected(name))
+            listbox.bind("<Double-Button-1>", lambda event, name=key: self._go_to_selected(name))
 
             self.list_boxes[key] = listbox
             self.list_tabs[key] = tab
 
         ttk.Label(
             frame,
-            text="Double-click a song in any list to send it back to the front of the queue.",
+            text=(
+                "Double-click a song in any list to jump to it — you can change a "
+                "LIKE or DISLIKE at any time, then use Forward or Resume Queue to "
+                "get back to where you left off."
+            ),
             foreground="#555555",
         ).pack(fill="x", pady=(5, 0))
 
@@ -1528,7 +1653,10 @@ class SongCuratorApp:
 
         ttk.Label(
             frame,
-            text="Shortcuts:  ←  Like    →  Dislike    Space  Play / Pause",
+            text=(
+                "Shortcuts:  ←  Like    →  Dislike    "
+                "↑  Back    ↓  Forward    Home  Resume    Space  Play / Pause"
+            ),
             anchor="w",
             foreground="#555555",
         ).pack(fill="x")
@@ -1538,6 +1666,9 @@ class SongCuratorApp:
 
         self.root.bind("<Left>", lambda event: self._shortcut(lambda: self._classify(liked=True)))
         self.root.bind("<Right>", lambda event: self._shortcut(lambda: self._classify(liked=False)))
+        self.root.bind("<Up>", lambda event: self._shortcut(self._go_back))
+        self.root.bind("<Down>", lambda event: self._shortcut(self._go_forward))
+        self.root.bind("<Home>", lambda event: self._shortcut(self._resume_to_frontier))
         self.root.bind("<space>", lambda event: self._shortcut(self._toggle_playback))
 
     def _shortcut(self, action: Callable[[], None]) -> None:
@@ -1573,24 +1704,11 @@ class SongCuratorApp:
     # ------------------------------------------------------------------
 
     def _configure_drag_and_drop(self) -> None:
-        """Enable drag and drop if tkinterdnd2 is installed."""
+        """Enable drag and drop of files and folders onto the drop panel."""
 
-        if tkinterdnd2 is None:
-            self.drop_label.configure(
-                text=(
-                    "CLICK HERE TO ADD AUDIO FILES\n\n"
-                    "Install tkinterdnd2 for drag-and-drop support"
-                )
-            )
-            return
-
-        try:
-            for widget in (self.drop_label, self.drop_frame):
-                widget.drop_target_register(DND_FILES)
-                widget.dnd_bind("<<Drop>>", self._handle_drop)
-
-        except Exception:
-            LOGGER.exception("Could not configure drag-and-drop.")
+        for widget in (self.drop_label, self.drop_frame):
+            widget.drop_target_register(DND_FILES)
+            widget.dnd_bind("<<Drop>>", self._handle_drop)
 
     def _handle_drop(self, event: object) -> None:
         """Handle dropped files and folders."""
@@ -1644,41 +1762,40 @@ class SongCuratorApp:
         )
 
         self._refresh_lists()
-        self._update_counts()
         self._schedule_session_save()
 
-        # Analyze the first queued song so it is ready to play.
-        if self.song_queue.current_song is not None and self.displayed_song is None:
-            self._show_current_song()
+        # Show the first queued song so it is ready to play, but don't
+        # interrupt whatever the user is currently reviewing.
+        if self.displayed_song is None and self.song_queue.first_pending is not None:
+            self._show_song(self.song_queue.first_pending)
 
     # ------------------------------------------------------------------
-    # Current song
+    # Displaying and navigating songs
     # ------------------------------------------------------------------
 
-    def _show_current_song(self) -> None:
-        """Display and analyze the next song."""
+    def _show_song(self, song: Optional[Song]) -> None:
+        """
+        Display and analyze a song, or clear the display if None.
 
-        song = self.song_queue.current_song
+        This is the single place that changes which song is on screen, so
+        every navigation action (advancing the queue, Back/Forward, Resume,
+        or double-clicking a song in a list) goes through it.
+        """
 
-        if song is None:
-            self.audio_player.stop()
-
-            self.current_analysis = None
-            self.displayed_song = None
-
-            self.song_name_var.set("No more songs to review")
-            self.song_path_var.set("")
-            self.position_var.set("")
-            self.status_var.set("Queue finished. You can add more songs.")
-
-            self._disable_action_buttons()
-            self._refresh_lists()
-
-            return
+        self.audio_player.stop()
 
         self.current_song_token += 1
         self.current_analysis = None
         self.displayed_song = song
+
+        if song is None:
+            self.auto_play = False
+            self.song_name_var.set("No song selected")
+            self.song_path_var.set("")
+            self.position_var.set("")
+            self._disable_action_buttons()
+            self._refresh_lists()
+            return
 
         self.song_name_var.set(song.name)
         self.song_path_var.set(str(song.path))
@@ -1689,6 +1806,85 @@ class SongCuratorApp:
         self._refresh_lists()
 
         self._start_analysis(song, self.current_song_token)
+
+    def _show_frontier(self) -> None:
+        """Jump to the first not-yet-classified song, or report the queue is done."""
+
+        song = self.song_queue.first_pending
+
+        self._show_song(song)
+
+        if song is None:
+            message = (
+                "Queue finished. You can add more songs."
+                if self.song_queue.songs
+                else "Add audio files to begin."
+            )
+
+            self.status_var.set(message)
+
+    def _resume_to_frontier(self) -> None:
+        """Jump forward to wherever the review queue left off."""
+
+        if self.song_queue.first_pending is None:
+            messagebox.showinfo(APPLICATION_NAME, "There are no more songs waiting to be reviewed.")
+            return
+
+        self._show_frontier()
+
+    def _current_index(self) -> Optional[int]:
+        """Return the displayed song's position in the full song list, if any."""
+
+        if self.displayed_song is None:
+            return None
+
+        return self.song_queue.index_of(self.displayed_song)
+
+    def _go_back(self) -> None:
+        """Step back to the previous song, whatever its classification."""
+
+        songs = self.song_queue.songs
+
+        if not songs:
+            return
+
+        index = self._current_index()
+
+        if index is None:
+            # Nothing displayed (e.g. the queue just finished): step to the
+            # last song so Back always has somewhere sensible to land.
+            self._show_song(songs[-1])
+        elif index > 0:
+            self._show_song(songs[index - 1])
+
+    def _go_forward(self) -> None:
+        """Step forward to the next song, whatever its classification."""
+
+        index = self._current_index()
+
+        if index is None:
+            return
+
+        songs = self.song_queue.songs
+
+        if index + 1 < len(songs):
+            self._show_song(songs[index + 1])
+        else:
+            self._show_frontier()
+
+    def _update_nav_buttons(self) -> None:
+        """Enable or disable Back / Forward / Resume based on what's available."""
+
+        songs = self.song_queue.songs
+        index = self._current_index()
+
+        can_go_back = bool(songs) and (index is None or index > 0)
+        can_go_forward = index is not None and index + 1 < len(songs)
+        can_resume = self.song_queue.first_pending is not None
+
+        self.back_button.configure(state="normal" if can_go_back else "disabled")
+        self.forward_button.configure(state="normal" if can_go_forward else "disabled")
+        self.resume_button.configure(state="normal" if can_resume else "disabled")
 
     # ------------------------------------------------------------------
     # Analysis
@@ -1754,8 +1950,15 @@ class SongCuratorApp:
 
         except Exception as exc:
             LOGGER.exception("Audio analysis failed for %s.", song.path)
-            self.root.after(0, lambda: self._analysis_failed(song, token, exc))
+
+            # Capture the exception as a default argument so that it remains
+            # available when the Tkinter callback executes later.
+            self.root.after(
+                0,
+                lambda error=exc: self._analysis_failed(song, token, error),
+            )
             return
+
 
         self.root.after(
             0, lambda: self._analysis_finished(song, token, result, preview_seconds))
@@ -1809,7 +2012,7 @@ class SongCuratorApp:
 
         except Exception as exc:
             LOGGER.exception("Could not play %s.", song.path)
-            self._skip_unplayable_song(song, token, exc)
+            self._handle_unusable_song(song, token, exc)
 
     def _analysis_failed(self, song: Song, token: int, exc: Exception) -> None:
         """Handle an FFmpeg/FFprobe failure."""
@@ -1819,13 +2022,46 @@ class SongCuratorApp:
 
         self.is_analyzing = False
 
-        LOGGER.warning("Skipping song because analysis failed: %s | %s", song.path, exc)
+        LOGGER.warning("Analysis failed for %s: %s", song.path, exc)
 
-        self.status_var.set(f"Could not analyze '{song.name}'. Skipping.")
+        self._handle_unusable_song(song, token, exc)
 
-        self._skip_current_without_classification(song)
+    def _handle_unusable_song(self, song: Song, token: int, exc: Exception) -> None:
+        """
+        Handle a song that could not be analyzed or played.
 
-        self.root.after(300, self._show_current_song)
+        If it was still pending, it's marked skipped and the queue advances
+        automatically, matching the old "just move on" behavior. If it had
+        already been liked or disliked, that classification is left alone —
+        the file may simply be temporarily locked or offline — and the
+        failure is just reported so nothing is silently reclassified.
+        """
+
+        if token != self.current_song_token:
+            return
+
+        self.audio_player.stop()
+        self.is_analyzing = False
+
+        previous_status = self.song_queue.status_of(song)
+
+        if previous_status != STATUS_PENDING:
+            self.status_var.set(f"Could not use '{song.name}': {exc}")
+            self._disable_action_buttons()
+            self._update_nav_buttons()
+            return
+
+        self.song_queue.set_status(song, STATUS_SKIPPED)
+
+        self.displayed_song = None
+        self.current_analysis = None
+
+        self.status_var.set(f"Could not use '{song.name}'. Skipping.")
+
+        self._refresh_lists()
+        self._schedule_session_save()
+
+        self.root.after(300, self._show_frontier)
 
     def _playing_status(self) -> str:
         """Return the status text shown while a preview plays."""
@@ -1840,9 +2076,9 @@ class SongCuratorApp:
     # ------------------------------------------------------------------
 
     def _play_current(self) -> None:
-        """Start continuous playback of the current song."""
+        """Start continuous playback of the displayed song."""
 
-        song = self.song_queue.current_song
+        song = self.displayed_song
 
         if song is None or self.is_analyzing:
             return
@@ -1877,12 +2113,12 @@ class SongCuratorApp:
 
         except Exception as exc:
             LOGGER.exception("Could not play %s.", song.path)
-            self._skip_unplayable_song(song, self.current_song_token, exc)
+            self._handle_unusable_song(song, self.current_song_token, exc)
 
     def _pause_or_resume_current(self) -> None:
         """Pause or resume continuous playback."""
 
-        if self.song_queue.current_song is None or self.is_analyzing:
+        if self.displayed_song is None or self.is_analyzing:
             return
 
         if self.current_analysis is None:
@@ -1916,7 +2152,7 @@ class SongCuratorApp:
                 self.audio_player.stop()
                 self.pause_button.configure(text="⏸  Pause")
 
-                if self.song_queue.current_song is not None:
+                if self.displayed_song is not None:
                     if self.auto_dislike_var.get() and self.auto_play:
                         self.status_var.set("No LIKE given. Disliking automatically.")
                         self._classify(liked=False, automatic=True)
@@ -1933,65 +2169,60 @@ class SongCuratorApp:
     # Classification
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _classification_verb(previous_status: str, liked: bool, automatic: bool) -> str:
+        """Return the status-bar verb describing a classification change."""
+
+        new_status = STATUS_LIKED if liked else STATUS_DISLIKED
+
+        if previous_status == new_status:
+            return "Liked" if liked else "Disliked"
+
+        if previous_status in (STATUS_LIKED, STATUS_DISLIKED):
+            return f"Changed to {'liked' if liked else 'disliked'}"
+
+        if automatic:
+            return "Auto-disliked"
+
+        return "Liked" if liked else "Disliked"
+
     def _classify(self, liked: bool, automatic: bool = False) -> None:
-        """Classify the currently displayed song."""
+        """
+        Classify the displayed song.
 
-        if self.is_analyzing or self.song_queue.current_song is None:
+        Works whether the song is still pending or was already liked or
+        disliked earlier, so a past decision can always be changed. If this
+        was the review frontier, the queue automatically advances to the new
+        frontier, same as before. If this was an older song being revisited,
+        the display stays put so the change is visible; use Forward or
+        Resume to head back to where you left off.
+        """
+
+        song = self.displayed_song
+
+        if self.is_analyzing or song is None:
             return
+
+        was_frontier = song == self.song_queue.first_pending
 
         self.audio_player.stop()
 
-        classified = self.song_queue.classify_current(liked=liked)
+        previous_status = self.song_queue.status_of(song)
 
-        if classified is None:
+        if not self.song_queue.classify(song, liked):
             return
 
-        self.current_song_token += 1
-        self.current_analysis = None
-        self.displayed_song = None
+        verb = self._classification_verb(previous_status, liked, automatic)
 
-        verb = "Liked" if liked else ("Auto-disliked" if automatic else "Disliked")
-        self.status_var.set(f"{verb}: {classified.name}")
-
-        LOGGER.info("%s: %s", verb, classified.path)
+        self.status_var.set(f"{verb}: {song.name}")
+        LOGGER.info("%s: %s", verb, song.path)
 
         self._refresh_lists()
-        self._update_counts()
         self._schedule_session_save()
 
-        # Advance. If auto_play is on, _analysis_finished starts the next preview.
-        self.root.after(100, self._show_current_song)
-
-    def _skip_unplayable_song(self, song: Song, token: int, exc: Exception) -> None:
-        """Skip a song that pygame cannot play."""
-
-        if token != self.current_song_token:
-            return
-
-        self.audio_player.stop()
-
-        LOGGER.warning("Skipping unplayable file %s: %s", song.path, exc)
-
-        self.status_var.set(f"Could not play '{song.name}'. Skipping.")
-
-        self._skip_current_without_classification(song)
-
-        self.root.after(300, self._show_current_song)
-
-    def _skip_current_without_classification(self, song: Song) -> None:
-        """Mark a failed song as skipped instead of liked or disliked."""
-
-        if self.song_queue.current_song != song:
-            return
-
-        self.song_queue.set_status(song, STATUS_SKIPPED)
-
-        self.displayed_song = None
-        self.current_analysis = None
-
-        self._refresh_lists()
-        self._update_counts()
-        self._schedule_session_save()
+        if was_frontier:
+            # Advance. If auto_play is on, _analysis_finished starts the next preview.
+            self.root.after(100, self._show_frontier)
 
     # ------------------------------------------------------------------
     # Buttons
@@ -2027,7 +2258,14 @@ class SongCuratorApp:
         )
 
     def _refresh_lists(self) -> None:
-        """Rebuild every list from the single source of truth."""
+        """
+        Resync every part of the UI with the song queue.
+
+        This is the single "repaint" call: it rebuilds the four lists,
+        highlights wherever the displayed song appears, and updates the
+        counts label and the Back / Forward / Resume buttons. Every action
+        that changes the queue calls this instead of updating pieces by hand.
+        """
 
         all_songs = list(self.song_queue.songs)
         remaining = self.song_queue.pending
@@ -2041,11 +2279,9 @@ class SongCuratorApp:
             "disliked": disliked,
         }
 
-        current = self.song_queue.current_song
-
         for key, songs in self._list_contents.items():
             listbox = self.list_boxes[key]
-            selection = listbox.yview()[0]
+            scroll_position = listbox.yview()[0]
 
             listbox.delete(0, tk.END)
 
@@ -2055,12 +2291,15 @@ class SongCuratorApp:
                 else:
                     listbox.insert(tk.END, song.name)
 
-            listbox.yview_moveto(selection)
+            listbox.yview_moveto(scroll_position)
 
-        # Highlight the song being reviewed.
-        if current is not None and remaining:
-            self.list_boxes["remaining"].selection_clear(0, tk.END)
-            self.list_boxes["remaining"].selection_set(0)
+            # Highlight the song currently on screen, wherever it appears.
+            listbox.selection_clear(0, tk.END)
+
+            if self.displayed_song is not None and self.displayed_song in songs:
+                index = songs.index(self.displayed_song)
+                listbox.selection_set(index)
+                listbox.see(index)
 
         labels = (
             ("all", "All", len(all_songs)),
@@ -2072,8 +2311,14 @@ class SongCuratorApp:
         for key, label, count in labels:
             self.notebook.tab(self.list_tabs[key], text=f"{label} ({count})")
 
-    def _requeue_selected(self, list_key: str) -> None:
-        """Send the double-clicked song back to the front of the queue."""
+        self._update_counts()
+        self._update_nav_buttons()
+
+    def _go_to_selected(self, list_key: str) -> None:
+        """Jump to the double-clicked song, whatever its classification."""
+
+        if self.is_analyzing:
+            return
 
         listbox = self.list_boxes[list_key]
         selection = listbox.curselection()
@@ -2089,42 +2334,21 @@ class SongCuratorApp:
 
         song = songs[index]
 
-        if self.song_queue.status_of(song) == STATUS_PENDING and song == self.displayed_song:
+        if song == self.displayed_song:
             return
 
-        self.song_queue.requeue(song)
-
-        self.status_var.set(f"Requeued: {song.name}")
-
-        self._refresh_lists()
-        self._update_counts()
-        self._schedule_session_save()
-
-        if not self.is_analyzing:
-            self._show_current_song()
+        self._show_song(song)
+        self.status_var.set(f"Reviewing: {song.name}")
 
     # ------------------------------------------------------------------
     # Clear operations
     # ------------------------------------------------------------------
 
     def _reset_current_display(self, message: str) -> None:
-        """Stop playback and clear the current song display."""
+        """Stop playback, clear the current song display, and resync the UI."""
 
-        self.audio_player.stop()
-        self.auto_play = False
-
-        self.current_song_token += 1
-        self.current_analysis = None
-        self.displayed_song = None
-
-        self.song_name_var.set("No song selected")
-        self.song_path_var.set("")
-        self.position_var.set("")
+        self._show_song(None)
         self.status_var.set(message)
-
-        self._disable_action_buttons()
-        self._refresh_lists()
-        self._update_counts()
         self._schedule_session_save()
 
     def _clear_queue(self) -> None:
@@ -2148,12 +2372,21 @@ class SongCuratorApp:
         if not messagebox.askyesno(APPLICATION_NAME, "Clear the liked list?"):
             return
 
+        # If the song on screen is one of the liked songs, it's about to be
+        # removed from the queue entirely, so the display can't stay put.
+        clearing_displayed = (
+            self.displayed_song is not None
+            and self.song_queue.status_of(self.displayed_song) == STATUS_LIKED
+        )
+
         self.song_queue.clear_liked()
+
+        if clearing_displayed:
+            self._show_song(None)
 
         self.status_var.set("Liked list cleared.")
 
         self._refresh_lists()
-        self._update_counts()
         self._schedule_session_save()
 
     def _clear_disliked(self) -> None:
@@ -2165,12 +2398,19 @@ class SongCuratorApp:
         if not messagebox.askyesno(APPLICATION_NAME, "Clear the disliked list?"):
             return
 
+        clearing_displayed = (
+            self.displayed_song is not None
+            and self.song_queue.status_of(self.displayed_song) == STATUS_DISLIKED
+        )
+
         self.song_queue.clear_disliked()
+
+        if clearing_displayed:
+            self._show_song(None)
 
         self.status_var.set("Disliked list cleared.")
 
         self._refresh_lists()
-        self._update_counts()
         self._schedule_session_save()
 
     def _clear_everything(self) -> None:
@@ -2334,7 +2574,6 @@ class SongCuratorApp:
             message += "\n\nFirst error:\n" + result.error_messages[0]
 
         self._refresh_lists()
-        self._update_counts()
         self._schedule_session_save()
 
         messagebox.showinfo(APPLICATION_NAME, message)
@@ -2369,16 +2608,6 @@ class SongCuratorApp:
             messagebox.showinfo(APPLICATION_NAME, "There are no disliked songs.")
             return
 
-        use_recycle_bin = send2trash is not None
-
-        if use_recycle_bin:
-            warning = "The files will be sent to the recycle bin."
-        else:
-            warning = (
-                "The files will be deleted PERMANENTLY and cannot be recovered.\n\n"
-                "Install send2trash if you would rather use the recycle bin."
-            )
-
         preview = "\n".join(song.name for song in songs[:10])
 
         if len(songs) > 10:
@@ -2386,16 +2615,8 @@ class SongCuratorApp:
 
         if not messagebox.askyesno(
             APPLICATION_NAME,
-            f"Delete {len(songs)} disliked file(s) from disk?\n\n{warning}\n\n{preview}",
+            f"Send {len(songs)} disliked file(s) to the recycle bin?\n\n{preview}",
             icon="warning",
-        ):
-            return
-
-        if not use_recycle_bin and not messagebox.askyesno(
-            APPLICATION_NAME,
-            f"Last chance.\n\nPermanently delete {len(songs)} file(s)?",
-            icon="warning",
-            default="no",
         ):
             return
 
@@ -2409,13 +2630,13 @@ class SongCuratorApp:
 
         thread = threading.Thread(
             target=self._delete_worker,
-            args=(songs, use_recycle_bin),
+            args=(songs,),
             daemon=True,
         )
 
         thread.start()
 
-    def _delete_worker(self, songs: Sequence[Song], use_recycle_bin: bool) -> None:
+    def _delete_worker(self, songs: Sequence[Song]) -> None:
         """Perform the deletion in the background."""
 
         def progress(index: int, total: int, filename: str) -> None:
@@ -2425,7 +2646,7 @@ class SongCuratorApp:
         try:
             result = self.output_manager.delete(
                 songs=songs,
-                use_recycle_bin=use_recycle_bin,
+                use_recycle_bin=True,
                 progress_callback=progress,
             )
 
@@ -2443,18 +2664,24 @@ class SongCuratorApp:
 
         removed = {normalize_path(str(path)) for path in result.removed_paths}
 
+        # If the song on screen was one of the ones just deleted, its object
+        # is about to be dropped from the queue, so the display can't stay
+        # pointed at it — jump to wherever review should continue instead.
+        displayed_removed = self.displayed_song is not None and self.displayed_song.key in removed
+
         self.song_queue.remove(
             [song for song in self.song_queue.songs if song.key in removed])
 
-        destination = "recycle bin" if result.used_recycle_bin else "disk"
-
         self.status_var.set(
-            f"Delete finished. Removed from {destination}: {result.deleted}, "
+            f"Delete finished. Removed from recycle bin: {result.deleted}, "
             f"Already gone: {result.missing}, Errors: {result.errors}"
         )
 
-        self._refresh_lists()
-        self._update_counts()
+        if displayed_removed:
+            self._show_frontier()
+        else:
+            self._refresh_lists()
+
         self._save_session_now()
 
         message = (
@@ -2513,7 +2740,7 @@ def main() -> None:
 
     LOGGER.info("Starting %s.", APPLICATION_NAME)
 
-    root = tkinterdnd2.Tk() if tkinterdnd2 is not None else tk.Tk()
+    root = tkinterdnd2.Tk()
 
     SongCuratorApp(root)
 
